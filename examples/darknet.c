@@ -3,10 +3,13 @@
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include "nnpack.h"
 
-extern void predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *filename, int top);
-extern void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filename, float thresh, float hier_thresh, char *outfile, int fullscreen);
+#ifdef NNPACK
+#include "nnpack.h"
+#endif
+
+extern float predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *filename, int top);
+extern float test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filename, float thresh, float hier_thresh, char *outfile, int fullscreen);
 extern void run_yolo(int argc, char **argv);
 extern void run_detector(int argc, char **argv);
 extern void run_coco(int argc, char **argv);
@@ -22,6 +25,7 @@ extern void run_go(int argc, char **argv);
 extern void run_art(int argc, char **argv);
 extern void run_super(int argc, char **argv);
 extern void run_lsd(int argc, char **argv);
+extern void run_test(int argc, char **argv);
 
 void average(int argc, char *argv[])
 {
@@ -400,12 +404,16 @@ void visualize(char *cfgfile, char *weightfile)
 
 int main(int argc, char **argv)
 {
+
+#ifdef NNPACK
+    enum nnp_status status =  nnp_initialize();
+    printf("NNPACK initialize status: %d\n", status);
+#endif
+
     //test_resize("data/bad.jpg");
     //test_box();
     //test_convolutional_layer();
 
-    enum nnp_status status = nnp_initialize();
-    printf("NNPACK initialize status: %d\n", status);
 
     if(argc < 2){
         fprintf(stderr, "usage: %s <function>\n", argv[0]);
@@ -462,6 +470,8 @@ int main(int argc, char **argv)
         run_art(argc, argv);
     } else if (0 == strcmp(argv[1], "tag")){
         run_tag(argc, argv);
+    }  else if (0 == strcmp(argv[1], "con")){
+        run_test(argc, argv);
     } else if (0 == strcmp(argv[1], "3d")){
         composite_3d(argv[2], argv[3], argv[4], (argc > 5) ? atof(argv[5]) : 0);
     } else if (0 == strcmp(argv[1], "test")){
@@ -500,7 +510,50 @@ int main(int argc, char **argv)
         mkimg(argv[2], argv[3], atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), argv[7]);
     } else if (0 == strcmp(argv[1], "imtest")){
         test_resize(argv[2]);
-    } else {
+    } else if (0 == strcmp(argv[1], "bench_darknet19")){
+        printf("bench_c\n");
+        predict_classifier("cfg/imagenet1k.data", "cfg/darknet19.cfg", "darknet19.weights", "data/eagle.jpg", 5);
+    } else if (0 == strcmp(argv[1], "bench_yolo-20l")){
+        float thresh = .5;
+        char *filename = "data/dog.jpg";
+        char *outfile = 0;
+        int fullscreen = 0;
+        test_detector("cfg/coco.data", "cfg/yolov3-20l.cfg", "yolov3.weights", filename, thresh, .5, outfile, fullscreen);
+    }else if (0 == strcmp(argv[1], "bench_yolo-tiny")){
+        float thresh = .5;
+        char *filename = "data/giraffe.jpg";
+        char *outfile = 0;
+        int fullscreen = 0;
+        test_detector("cfg/coco.data", "cfg/yolov3-tiny.cfg", "yolov3-tiny.weights", filename, thresh, .5, outfile, fullscreen);
+    }  else if (0 == strcmp(argv[1], "bench_yolo_native")){
+        printf("bench_native yolo\n %s\n", argv[3]);
+        FILE *file = fopen(argv[3], "w");
+
+        float thresh = .5;
+        char *filename = "data/dog.jpg";
+        char *outfile = 0;
+        int fullscreen = 0;
+        
+
+        for(int k = 0; k < atoi(argv[2]); k++){
+            float result = test_detector("cfg/coco.data", "cfg/yolov3.cfg", "yolov3.weights", filename, thresh, .5, outfile, fullscreen);
+            fprintf(file, "%f\n", result);
+        }
+
+        fclose(file);
+        
+    }else if (0 == strcmp(argv[1], "bench_vgg_native")){
+        printf("bench_native vgg\n %s\n", argv[3]);
+        FILE *file = fopen(argv[3], "w");
+
+        for(int k = 0; k < atoi(argv[2]); k++){
+            float result = predict_classifier("cfg/imagenet1k.data", "cfg/vgg-16.cfg", "vgg-16.weights", "data/eagle.jpg", 5);
+            fprintf(file, "%f\n", result);
+        }
+
+        fclose(file);
+
+    }  else {
         fprintf(stderr, "Not an option: %s\n", argv[1]);
     }
     return 0;

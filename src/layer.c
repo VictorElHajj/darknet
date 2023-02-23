@@ -94,4 +94,9 @@ void free_layer(layer l)
     if(l.squared_gpu)             cuda_free(l.squared_gpu);
     if(l.norms_gpu)               cuda_free(l.norms_gpu);
 #endif
+#ifdef NNPACK
+    if(l.no_bias_npp)                 free(l.no_bias_npp);
+    if(l.workspace_buffer_npp)        free(l.workspace_buffer_npp);
+   // if(l.buffer_size_npp)         free(l.buffer_size_npp);
+#endif
 }

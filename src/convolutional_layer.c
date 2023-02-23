@@ -5,12 +5,15 @@
 #include "col2im.h"
 #include "blas.h"
 #include "gemm.h"
-#include "nnpack.h"
 #include <stdio.h>
 #include <time.h>
 
 #ifdef AI2
 #include "xnor_layer.h"
+#endif
+
+#ifdef NNPACK
+#include "nnpack.h"
 #endif
 
 void swap_binary(convolutional_layer *l)
@@ -219,7 +222,41 @@ convolutional_layer make_convolutional_layer(int batch, int h, int w, int c, int
     l.output = calloc(l.batch*l.outputs, sizeof(float));
     l.delta  = calloc(l.batch*l.outputs, sizeof(float));
 
+#ifdef NNPACK
+    l.forward = forward_convolutional_layer_nnp;
+    l.algorithm_npp = nnp_convolution_algorithm_implicit_gemm;
+
+#ifdef WT
+    l.algorithm_npp = l.size == 3 && l.stride == 1 ? nnp_convolution_algorithm_wt8x8 : nnp_convolution_algorithm_implicit_gemm;
+#endif
+#ifdef FT8
+    l.algorithm_npp = l.stride == 1 && l.size <= 8 ? nnp_convolution_algorithm_ft8x8 : nnp_convolution_algorithm_implicit_gemm;
+#endif
+#ifdef FT16
+    l.algorithm_npp = l.stride == 1 && l.size <= 16 ? nnp_convolution_algorithm_ft16x16 : nnp_convolution_algorithm_implicit_gemm;
+#endif
+#ifdef GEMM
+    l.algorithm_npp = nnp_convolution_algorithm_implicit_gemm;
+#endif
+#ifdef DIRECT
+	if(l.size==1){
+	    l.algorithm_npp = nnp_convolution_algorithm_direct;
+	}
+#endif
+#ifdef AUTO
+    l.algorithm_npp = nnp_convolution_algorithm_auto;
+#endif
+
+    int m = l.n/l.groups;
+    l.no_bias_npp = calloc(1, sizeof(float) * m);
+    size_t mem = calculate_buffer_size_npp(l);
+    l.workspace_buffer_npp = aligned_alloc(64,mem);
+    l.buffer_size_npp = mem;
+   
+#else
     l.forward = forward_convolutional_layer;
+#endif 
+
     l.backward = backward_convolutional_layer;
     l.update = update_convolutional_layer;
     if(binary){
@@ -406,6 +443,16 @@ void resize_convolutional_layer(convolutional_layer *l, int w, int h)
     cudnn_convolutional_setup(l);
 #endif
 #endif
+
+#ifdef NNPACK
+    int m = l->n/l->groups;
+    
+    l->no_bias_npp = realloc(l->no_bias_npp, sizeof(float) * m);
+    size_t mem = calculate_buffer_size_npp(*l);
+    free(l->workspace_buffer_npp);
+    l->workspace_buffer_npp = aligned_alloc(64,mem);
+    l->buffer_size_npp = mem;
+#endif
     l->workspace_size = get_workspace_size(*l);
 }
 
@@ -443,77 +490,167 @@ void backward_bias(float *bias_updates, float *delta, int batch, int n, int size
     }
 }
 
+
 void forward_convolutional_layer(convolutional_layer l, network net)
 {
     int i, j;
 
-    struct nnp_size input_size = {l.w, l.h};
-    struct nnp_padding input_padding = {l.pad, l.pad, l.pad, l.pad};
-    struct nnp_size kernel_size = {l.size, l.size};
-    struct nnp_size stride = {l.stride, l.stride};
+    fill_cpu(l.outputs*l.batch, 0, l.output, 1);
 
-    fill_cpu(l.outputs * l.batch, 0, l.output, 1);
-
-    if (l.xnor)
-    {
-        binarize_weights(l.weights, l.n, l.c / l.groups * l.size * l.size, l.binary_weights);
+    if(l.xnor){
+        binarize_weights(l.weights, l.n, l.c/l.groups*l.size*l.size, l.binary_weights);
         swap_binary(&l);
-        binarize_cpu(net.input, l.c * l.h * l.w * l.batch, l.binary_input);
+        binarize_cpu(net.input, l.c*l.h*l.w*l.batch, l.binary_input);
         net.input = l.binary_input;
     }
 
-    int m = l.n / l.groups;
-    int n = l.out_w * l.out_h;
-    for (i = 0; i < l.batch; ++i)
-    {
-        for (j = 0; j < l.groups; ++j)
-        {
-            float *im = net.input + (i * l.groups + j) * l.c / l.groups * l.h * l.w;
+    int m = l.n/l.groups;
+    int k = l.size*l.size*l.c/l.groups;
+    int n = l.out_w*l.out_h;
+    for(i = 0; i < l.batch; ++i){
+        for(j = 0; j < l.groups; ++j){
+            float *a = l.weights + j*l.nweights/l.groups;
+            float *b = net.workspace;
+            float *c = l.output + (i*l.groups + j)*n*m;
+            float *im =  net.input + (i*l.groups + j)*l.c/l.groups*l.h*l.w;
 
-            // gemm(0, 0, m, n, k, 1, a, k, b, n, 1, c, n);
-
-            // Darknet handles biases, so provide NNPack with empty biases
-            float *bias = calloc(1, sizeof(float) * m);
-
-            // If stride is not equal to 1, use gemm instead of fft
-            enum nnp_convolution_algorithm convolution_algorithm = l.stride == 1 ? nnp_convolution_algorithm_ft16x16 : nnp_convolution_algorithm_implicit_gemm;
-
-            nnp_convolution_inference(
-                convolution_algorithm,
-                nnp_convolution_transform_strategy_tuple_based,
-                (size_t)(l.c / l.groups),
-                (size_t)m,
-                input_size,
-                input_padding,
-                kernel_size,
-                stride,
-                im,
-                l.weights + j * l.nweights / l.groups,
-                bias,
-                l.output + j * n * m,
-                NULL,
-                NULL,
-                nnp_activation_identity,
-                NULL,
-                NULL, // Null threadpool means not parallel, fix
-                NULL);
+            if (l.size == 1) {
+                b = im;
+            } else {
+                im2col_cpu(im, l.c/l.groups, l.h, l.w, l.size, l.stride, l.pad, b);
+            }
+            gemm(0,0,m,n,k,1,a,k,b,n,1,c,n);
         }
     }
 
-    if (l.batch_normalize)
-    {
+    if(l.batch_normalize){
         forward_batchnorm_layer(l, net);
-    }
-    else
-    {
-        add_bias(l.output, l.biases, l.batch, l.n, l.out_h * l.out_w);
+    } else {
+        add_bias(l.output, l.biases, l.batch, l.n, l.out_h*l.out_w);
     }
 
-    activate_array(l.output, l.outputs * l.batch, l.activation);
-    if (l.binary || l.xnor)
-        swap_binary(&l);
-
+    activate_array(l.output, l.outputs*l.batch, l.activation);
+    if(l.binary || l.xnor) swap_binary(&l);
 }
+
+#ifdef NNPACK
+void forward_convolutional_layer_nnp(convolutional_layer l, network net)
+{
+    int i, j;
+
+    fill_cpu(l.outputs*l.batch, 0, l.output, 1);
+
+    if(l.xnor){
+        binarize_weights(l.weights, l.n, l.c/l.groups*l.size*l.size, l.binary_weights);
+        swap_binary(&l);
+        binarize_cpu(net.input, l.c*l.h*l.w*l.batch, l.binary_input);
+        net.input = l.binary_input;
+    }
+
+    int m = l.n/l.groups;
+    //int k = l.size*l.size*l.c/l.groups;
+    int n = l.out_w*l.out_h;
+
+
+
+    struct nnp_size input_size = { l.w, l.h };
+    struct nnp_padding input_padding = { l.pad, l.pad, l.pad, l.pad };
+    struct nnp_size kernel_size = { l.size, l.size };
+    struct nnp_size stride = { l.stride, l.stride };
+
+    //pthreadpool_t threadpool = pthreadpool_create(4);
+
+    for(i = 0; i < l.batch; ++i){
+        for(j = 0; j < l.groups; ++j){
+        //    float *a = l.weights + j*l.nweights/l.groups;
+        //    float *b = net.workspace;
+        //    float *c = l.output + (i*l.groups + j)*n*m;
+        float *im =  net.input + (i*l.groups + j)*l.c/l.groups*l.h*l.w;
+
+        //printf("hello \n");
+       
+        //float *bias = calloc(1, sizeof(float) * m);
+
+        enum nnp_status status = nnp_convolution_inference(
+            l.algorithm_npp,
+            nnp_convolution_transform_strategy_compute,
+            (size_t)(l.c / l.groups),
+            (size_t)m,
+            input_size,
+            input_padding,
+            kernel_size,
+            stride,
+            im,
+            l.weights +j*l.nweights / l.groups,
+            l.no_bias_npp,
+            l.output + (i*l.groups + j)*n*m,
+            l.workspace_buffer_npp,
+            &l.buffer_size_npp,
+            nnp_activation_identity,
+            NULL,
+            NULL,
+            NULL
+        );
+
+        
+        if (status != nnp_status_success) {
+            printf("NNPACK convolution: %d \n", (int)status);
+        }
+
+        }
+    }
+
+    if(l.batch_normalize){
+        forward_batchnorm_layer(l, net);
+    } else {
+       add_bias(l.output, l.biases, l.batch, l.n, l.out_h*l.out_w);
+    }
+
+    activate_array(l.output, l.outputs*l.batch, l.activation);
+    if(l.binary || l.xnor) swap_binary(&l);
+}
+
+size_t calculate_buffer_size_npp(convolutional_layer l){
+
+    int m = l.n/l.groups;
+
+    struct nnp_size input_size = { l.w, l.h };
+    struct nnp_padding input_padding = { l.pad, l.pad, l.pad, l.pad };
+    struct nnp_size kernel_size = { l.size, l.size };
+    struct nnp_size stride = { l.stride, l.stride };
+
+    size_t mem = 0;
+
+
+    enum nnp_status status = nnp_convolution_inference(
+            l.algorithm_npp,
+            nnp_convolution_transform_strategy_compute,
+            (size_t)(l.c / l.groups),
+            (size_t)m,
+            input_size,
+            input_padding,
+            kernel_size,
+            stride,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            &mem,
+            nnp_activation_identity,
+            NULL,
+            NULL,
+            NULL
+        );
+
+        if (status != nnp_status_success) {
+            printf("NNPACK convolution: %d \n", (int)status);
+        }
+
+        return mem;
+}
+
+#endif
 
 void backward_convolutional_layer(convolutional_layer l, network net)
 {

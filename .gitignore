@@ -29,3 +29,16 @@ ehthumbs.db
 Icon?
 Thumbs.db
 *.swp
+
+.vscode/
+
+*.a
+
+*.so
+
+.ipynb_checkpoints/test-checkpoint.ipynb
+
+
+bench/
+
+*.weights

@@ -557,8 +557,10 @@ void try_classifier(char *datacfg, char *cfgfile, char *weightfile, char *filena
     }
 }
 
-void predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *filename, int top)
+float  predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *filename, int top)
 {
+    float result = -1;
+
     network *net = load_network(cfgfile, weightfile, 0);
     set_batch_network(net, 1);
     srand(2222222);
@@ -582,7 +584,7 @@ void predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *fi
             printf("Enter Image Path: ");
             fflush(stdout);
             input = fgets(input, 256, stdin);
-            if(!input) return;
+            if(!input) return result;
             strtok(input, "\n");
         }
         image im = load_image_color(input, 0, 0);
@@ -597,7 +599,8 @@ void predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *fi
         float *predictions = network_predict(net, X);
         if(net->hierarchy) hierarchy_predictions(predictions, net->outputs, net->hierarchy, 1, 1);
         top_k(predictions, net->outputs, top, indexes);
-        fprintf(stderr, "%s: Predicted in %f seconds.\n", input, sec(clock()-time));
+	result =sec(clock()-time) ;
+        fprintf(stderr, "%s: Predicted in %f seconds.\n", input, result);
         for(i = 0; i < top; ++i){
             int index = indexes[i];
             //if(net->hierarchy) printf("%d, %s: %f, parent: %s \n",index, names[index], predictions[index], (net->hierarchy->parent[index] >= 0) ? names[net->hierarchy->parent[index]] : "Root");
@@ -608,6 +611,8 @@ void predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *fi
         free_image(im);
         if (filename) break;
     }
+    free_network(net);
+    return result;
 }
 
 
